@@ -1,0 +1,109 @@
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#define F_CPU 8000000UL
+#include <util/delay.h>
+
+#define ADC_MULT 10
+#define ADC_SCALE 50
+#define E_LENGTH 4
+#define OCR_ENCODE 25
+#define OCR_TURBO 252
+const char encoder[] = {0,1,3,2};
+
+short x_steps, y_steps = 0;
+short last_x, last_y = 0;
+char axis = 0;
+
+/** ADC interrupt interprets voltages from joystick and converts them
+   to number of steps the AVR needs to fake **/
+ISR(ADC_vect) {
+   unsigned short data = (ADC * ADC_MULT) / ADC_SCALE;
+   if (axis) {
+       y_steps += last_y - data;
+       last_y = data;
+       ADMUX = 0;
+       axis = 0;
+   }
+   else {
+       x_steps += last_x - data;
+       last_x = data;
+       ADMUX = 1;
+       axis = 1;
+   }
+}
+
+/** Timer interrupt updates the output to fake rotary encoding
+   and decreases the number of steps left **/
+ISR(TIM0_COMPA_vect) {
+   // Update the step counter
+   if (x_steps > 0)
+       x_steps -= 1;
+   else if (x_steps < 0)
+       x_steps += 1;
+
+   if (y_steps > 0)
+       y_steps -= 1;
+   else if (y_steps < 0)
+       y_steps += 1;
+   
+   // Update the encoder
+   PORTA = (PORTA & ~(0x3C)) | ((encoder[(last_x + x_steps) % E_LENGTH] << 2) | (encoder[(last_y + y_steps) % E_LENGTH] << 4));
+}
+
+int main(void) {
+   char turbo = 0; // Keep track of the turbo state
+
+   // Setup outputs
+   DDRA = 0x7C; // Enable outputs on pins 2 - 6 of port A
+   PORTA = (1 << 7); // Enable pull-up on button
+
+   // Setup ADC
+   ADCSRA |= (1 << ADPS2) | (1 << ADPS1); // Set prescaler to 64 (Which gives us 125KHz ADC clock)
+   ADCSRA |= (1 << ADEN); // Enable ADC
+
+   // Initialize x and y (so the controller doesn't shoot to the upper right corner...)
+   ADMUX = 0; // X axis
+   ADCSRA |= (1 << ADSC);
+   loop_until_bit_is_set(ADCSRA, ADIF);
+   last_x = (ADC * ADC_MULT) / ADC_SCALE;
+   ADMUX = 1; // Y axis
+   ADCSRA |= (1 << ADSC);
+   loop_until_bit_is_set(ADCSRA, ADIF);
+   last_y = (ADC * ADC_MULT) / ADC_SCALE;
+   ADMUX = 0;
+   
+   sei(); // Enable global interrupts
+
+   // Setup timer for encoder
+   TCCR0A |= (1 << WGM01); // Enable CTC
+   TCCR0B |= (1 << CS02); // Set prescale to 100 and start timer
+   OCR0A = OCR_ENCODE; // Set compare for timer 0
+   TIMSK0 |= (1 << OCIE0A); // Enable interrupt
+
+   // Setup timer for turbo
+   TCCR1B |= (1 << WGM12); // Set CTC
+   TCCR1B |= (1 << CS12) | (1 << CS10); // Set clock prescale to 1024 (and start timer)
+   OCR1A = OCR_TURBO; // Set compare for timer 1
+
+   // Start automatic ADC update
+   ADCSRA |= (1 << ADATE); // Enable automatic trigger
+   ADCSRA |= (1 << ADIE); // Enable ADC interrupt
+   ADCSRA |= (1 << ADSC); // Start conversion
+
+   for (;;) {
+       if (bit_is_set(PINA, 7) && turbo) {
+           // Deactivate turbo
+           TCCR1A &= ~(1 << COM1A0); // Deactivate timer output
+           PORTA &= ~(1 << 6); // Deactivate pin
+           turbo = 0;
+       }
+       else if (bit_is_clear(PINA, 7) && !turbo){
+           // Activate turbo
+           TCCR1A |= (1 << COM1A0); // Activate timer output
+           turbo = 1;
+       }
+       _delay_us(10);
+   }
+   return 0;
+}
